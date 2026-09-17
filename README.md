@@ -8,7 +8,8 @@
 
 ## 快速开始
 
-1. 用 Unity 6（本工程为 6000.4.12f1）打开项目。
+0. 克隆后用 Unity Hub 的「Add project from disk」指向本目录。
+1. 用 Unity 6（本工程为 6000.4.12f1）打开。**首次打开需要重新导入资源并编译脚本，约 1~3 分钟**——`Library/`、`Logs/`、`Temp/` 等生成目录不在版本库里（见 `.gitignore`），Unity 会自动重建。
 2. 菜单 **GameOfLife → 打开演示场景**（场景缺失时会自动生成）。
 3. 按 **Play**。
 

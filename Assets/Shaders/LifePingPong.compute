@@ -1,0 +1,458 @@
+// 康威生命游戏 —— 基础版 kernel（档一之前的基准实现：1 texel = 1 细胞）
+//
+// 坐标约定：texel(x,y) 与网格(x,y) 一一对应，x 向右、y 向上由 CPU 侧的
+// GridPos 定义，kernel 内不做任何翻转。显示端的 Y 方向差异由显示层单独处理。
+//
+// 三个 kernel 分工：
+//   Clear —— 整片清零
+//   Stamp —— 按坐标表写入初始活细胞
+//   Step  —— 读取 _Source，写出下一代到 _Result
+
+#pragma kernel Clear
+#pragma kernel Stamp
+#pragma kernel Step
+#pragma kernel StepShared
+#pragma kernel StampPacked
+#pragma kernel StepPacked
+#pragma kernel ClearPacked
+#pragma kernel StampBitPacked
+#pragma kernel StepBitPacked
+#pragma kernel ExpandBitPacked
+#pragma kernel FillRandom
+#pragma kernel FillRandomPacked
+#pragma kernel FillRandomBitPacked
+
+RWTexture2D<float4> _State;
+Texture2D<float4> _Source;
+RWTexture2D<float4> _Result;
+
+StructuredBuffer<int2> _Cells;
+StructuredBuffer<uint2> _StampEntries;   // .x = texel 线性下标，.y = 4 位通道掩码
+
+RWTexture2D<uint>   _StatePacked;
+Texture2D<uint>     _SourcePacked;
+RWTexture2D<uint>   _ResultPacked;
+RWTexture2D<float4> _Expanded;
+
+uint  _Width;
+uint  _Height;
+uint  _TextureWidth;   // 每行 texel 数：基础版与档一等于 _Width，档二等于 _Width / 4
+uint  _WordsPerRow;    // 档三：每行 uint 数量，等于 _Width / 32
+uint  _CellCount;
+uint  _EntryCount;
+uint  _Seed;             // 随机初始状态的种子
+uint  _AliveThreshold;   // 哈希值小于该阈值的格子为活细胞（整数比较，避免浮点分歧）
+float _Wrap;      // 1 = 环面边界，0 = 死边界
+
+// 存活值统一写 1.0：8 位 UNORM 纹理上整数 1 实际会存成 1/255，
+// 与判活阈值 0.5 比较时会全部判死，画面全黑。
+// 注意 alpha 必须是 0：档二把 RGBA 四个通道都当作细胞，若死值写成 (0,0,0,1)，
+// 那么每个 texel 的 alpha 通道都会被读成"活细胞"，整片棋盘凭空多出一堆生命。
+// 基础版与档一只读 .r，不受影响。
+static const float4 ALIVE = float4(1, 1, 1, 1);
+static const float4 DEAD  = float4(0, 0, 0, 0);
+
+// 坐标回绕。所有调用点传入的偏移量都不超过 ±1 格，因此条件加减即可，
+// 不需要整数取模——有符号整数取模在 D3D11 上会被编译成一长串指令，
+// 着色器编译器会给出 "integer modulus may be much slower" 警告。
+int WrapCoord(int value, int size)
+{
+    // 写成单个表达式而不是提前 return：带提前返回的小函数会让 D3D11 编译器
+    // 无法证明所有路径都有返回值，从而在每个调用点报
+    // "use of potentially uninitialized variable"。
+    return value + (value < 0 ? size : 0) - (value >= size ? size : 0);
+}
+
+// 线程组边长（档一）。16x16 = 256 线程，共享内存为 (16+2)^2 个 float。
+#define TILE 16
+
+// 读取网格中任意坐标的状态，统一处理两种边界语义。
+// 邻居偏移最小为 -1，环面模式下加一个周期即可保证取模前为正。
+float SampleState(int2 p)
+{
+    if (_Wrap > 0.5)
+    {
+        p.x = WrapCoord(p.x, (int)_Width);
+        p.y = WrapCoord(p.y, (int)_Height);
+    }
+    else if (p.x < 0 || p.y < 0 || p.x >= (int)_Width || p.y >= (int)_Height)
+    {
+        return 0.0;   // 死边界：越界按死细胞处理
+    }
+
+    return _Source.Load(int3(p, 0)).r;
+}
+
+[numthreads(8, 8, 1)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+    _State[id.xy] = DEAD;
+}
+
+[numthreads(64, 1, 1)]
+void Stamp(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _CellCount) return;
+
+    int2 cell = _Cells[id.x];
+    if (cell.x < 0 || cell.y < 0 || cell.x >= (int)_Width || cell.y >= (int)_Height) return;
+
+    _State[uint2(cell)] = ALIVE;
+}
+
+[numthreads(8, 8, 1)]
+void Step(uint3 id : SV_DispatchThreadID)
+{
+    // 线程组按 8 取整，越界线程必须直接返回，否则会静默破坏相邻数据。
+    if (id.x >= _Width || id.y >= _Height) return;
+
+    uint neighbours = 0;
+
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            if (dx == 0 && dy == 0) continue;
+
+            neighbours += SampleState(int2(id.xy) + int2(dx, dy)) > 0.5 ? 1u : 0u;
+        }
+    }
+
+    bool self = SampleState(int2(id.xy)) > 0.5;
+    bool next = self ? (neighbours == 2u || neighbours == 3u)   // 生存 S23
+                     : (neighbours == 3u);                      // 诞生 B3
+
+    _Result[id.xy] = next ? ALIVE : DEAD;
+}
+
+// ---------------------------------------------------------------------------
+// 档二：一个 texel 的 RGBA 四个通道各存一个细胞（R = x, G = x+1, B = x+2, A = x+3）
+//
+// 适用前提：网格宽度必须是 4 的倍数。此时纹理行内连续，
+// 邻居读取可以按 texel 对齐（每行只需 3 次 Load 就能覆盖 6 个相邻列），
+// 且"按细胞回绕"与"按 texel 回绕"等价。
+// 宽度不是 4 的倍数时，尾部会有填充通道，两种回绕方式不再等价，
+// 因此主机侧直接拒绝创建这种组合（见 GpuGridKernel 构造函数），而不是给出错误结果。
+// ---------------------------------------------------------------------------
+
+float4 LoadPackedTexel(int texelX, int rowY)
+{
+    if (_Wrap > 0.5)
+    {
+        texelX = WrapCoord(texelX, (int)_TextureWidth);
+        rowY   = WrapCoord(rowY,   (int)_Height);
+    }
+    else if (texelX < 0 || rowY < 0 || texelX >= (int)_TextureWidth || rowY >= (int)_Height)
+    {
+        return float4(0, 0, 0, 0);
+    }
+
+    return _Source.Load(int3(texelX, rowY, 0));
+}
+
+// 盖印：每个线程处理一个 texel，写入该 texel 需要置活的通道。
+// 主机侧已按 texel 聚合过，每个 texel 在列表里只出现一次，因此不存在读改写竞争。
+[numthreads(64, 1, 1)]
+void StampPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _EntryCount) return;
+
+    uint2 entry = _StampEntries[id.x];
+    uint2 texel = uint2(entry.x % _TextureWidth, entry.x / _TextureWidth);
+
+    float4 add = float4(
+        (entry.y & 1u) ? 1.0 : 0.0,
+        (entry.y & 2u) ? 1.0 : 0.0,
+        (entry.y & 4u) ? 1.0 : 0.0,
+        (entry.y & 8u) ? 1.0 : 0.0);
+
+    _State[texel] = saturate(_State[texel] + add);
+}
+
+[numthreads(8, 8, 1)]
+void StepPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TextureWidth || id.y >= _Height) return;
+
+    int texelX = int(id.x);
+    int rowY = int(id.y);
+
+    // 三行各取左中右 3 个 texel；相邻 6 个列值依次是 left.a, mid.rgba, right.r
+    float4 upL = LoadPackedTexel(texelX - 1, rowY + 1);
+    float4 upM = LoadPackedTexel(texelX,     rowY + 1);
+    float4 upR = LoadPackedTexel(texelX + 1, rowY + 1);
+
+    float4 midL = LoadPackedTexel(texelX - 1, rowY);
+    float4 midM = LoadPackedTexel(texelX,     rowY);
+    float4 midR = LoadPackedTexel(texelX + 1, rowY);
+
+    float4 dnL = LoadPackedTexel(texelX - 1, rowY - 1);
+    float4 dnM = LoadPackedTexel(texelX,     rowY - 1);
+    float4 dnR = LoadPackedTexel(texelX + 1, rowY - 1);
+
+    float u0 = upL.a, u1 = upM.r, u2 = upM.g, u3 = upM.b, u4 = upM.a, u5 = upR.r;
+    float s0 = midL.a, s1 = midM.r, s2 = midM.g, s3 = midM.b, s4 = midM.a, s5 = midR.r;
+    float d0 = dnL.a, d1 = dnM.r, d2 = dnM.g, d3 = dnM.b, d4 = dnM.a, d5 = dnR.r;
+
+    // 输出通道 i 对应列 baseX+i：
+    //   上一行 / 下一行取该列的左中右三个（i, i+1, i+2），
+    //   本行只取左右两个（i, i+2）——中间的 s[i+1] 就是细胞自身，必须排除，
+    //   否则每个细胞都会把自己算成一个邻居（基础版与档一由 dx==0 && dy==0 的跳过保证这一点）。
+    uint n0 = (uint)(u0 + u1 + u2 + s0 + s2 + d0 + d1 + d2);
+    uint n1 = (uint)(u1 + u2 + u3 + s1 + s3 + d1 + d2 + d3);
+    uint n2 = (uint)(u2 + u3 + u4 + s2 + s4 + d2 + d3 + d4);
+    uint n3 = (uint)(u3 + u4 + u5 + s3 + s5 + d3 + d4 + d5);
+
+    bool self0 = s1 > 0.5, self1 = s2 > 0.5, self2 = s3 > 0.5, self3 = s4 > 0.5;
+
+    float4 result;
+    result.r = (self0 ? (n0 == 2u || n0 == 3u) : (n0 == 3u)) ? 1.0 : 0.0;
+    result.g = (self1 ? (n1 == 2u || n1 == 3u) : (n1 == 3u)) ? 1.0 : 0.0;
+    result.b = (self2 ? (n2 == 2u || n2 == 3u) : (n2 == 3u)) ? 1.0 : 0.0;
+    result.a = (self3 ? (n3 == 2u || n3 == 3u) : (n3 == 3u)) ? 1.0 : 0.0;
+
+    _Result[id.xy] = result;
+}
+
+// ---------------------------------------------------------------------------
+// 档三：位打包，1 个 uint = 32 个细胞（最低位对应列号较小的一侧）
+//
+// 适用前提：网格宽度必须是 32 的倍数。此时每行正好是整数个字，不存在部分字，
+// 跨字移位与环面回绕都能用统一写法表达；否则尾部填充位会让移位边界难以处理。
+//
+// 邻居统计走位并行：
+//   1. 对每一行算出"左邻掩码 / 自身 / 右邻掩码"；
+//   2. 用全加器把三个 0/1 操作数压成 2 位计数（低位 = 异或，高位 = 多数）；
+//   3. 把三行的 2 位计数相加，得到每格 0~8 的邻居数；
+//   4. 逐位应用 B3/S23。
+// 跨字边界：左移要从上一个字的最高位补入，右移要从下一个字的最低位补入，
+// 首尾字在环面模式下互相补位——这是本档位最容易写错的地方。
+// ---------------------------------------------------------------------------
+
+uint LoadPackedWord(int wordX, int rowY)
+{
+    if (_Wrap > 0.5)
+    {
+        wordX = WrapCoord(wordX, (int)_WordsPerRow);
+        rowY  = WrapCoord(rowY,  (int)_Height);
+    }
+    else if (wordX < 0 || rowY < 0 || wordX >= (int)_WordsPerRow || rowY >= (int)_Height)
+    {
+        return 0u;
+    }
+
+    return _SourcePacked.Load(int3(wordX, rowY, 0));
+}
+
+// 一行的 2 位计数位平面。includeSelf = false 时只统计左右两格（用于本行，排除自身）。
+void RowPlanes(int wordX, int rowY, bool includeSelf, out uint lo, out uint hi)
+{
+    uint prev = LoadPackedWord(wordX - 1, rowY);
+    uint cur  = LoadPackedWord(wordX,     rowY);
+    uint next = LoadPackedWord(wordX + 1, rowY);
+
+    bool wrap = _Wrap > 0.5;
+    bool hasPrev = wrap || wordX > 0;
+    bool hasNext = wrap || wordX < (int)_WordsPerRow - 1;
+
+    uint left  = (cur << 1) | (hasPrev ? (prev >> 31) : 0u);
+    uint right = (cur >> 1) | (hasNext ? (next << 31) : 0u);
+
+    if (includeSelf)
+    {
+        lo = left ^ cur ^ right;
+        hi = (left & cur) | (left & right) | (cur & right);
+    }
+    else
+    {
+        lo = left ^ right;
+        hi = left & right;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void ClearPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _WordsPerRow || id.y >= _Height) return;
+    _StatePacked[id.xy] = 0u;
+}
+
+// 每个线程写一个 uint：主机侧已按字聚合位掩码，因此不存在同一字的读改写竞争。
+[numthreads(64, 1, 1)]
+void StampBitPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _EntryCount) return;
+
+    uint2 entry = _StampEntries[id.x];
+    uint2 word = uint2(entry.x % _WordsPerRow, entry.x / _WordsPerRow);
+    _StatePacked[word] |= entry.y;
+}
+
+[numthreads(8, 8, 1)]
+void StepBitPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _WordsPerRow || id.y >= _Height) return;
+
+    int wordX = int(id.x);
+    int rowY  = int(id.y);
+
+    uint upLo, upHi, midLo, midHi, downLo, downHi;
+    RowPlanes(wordX, rowY + 1, true,  upLo,   upHi);
+    RowPlanes(wordX, rowY,     false, midLo,  midHi);
+    RowPlanes(wordX, rowY - 1, true,  downLo, downHi);
+
+    // 先把上、中两行的 2 位计数相加（结果最多 3 位），再加上下行（最多 4 位）。
+    uint s0 = upLo ^ midLo;
+    uint t0 = upLo & midLo;
+    uint s1 = upHi ^ midHi ^ t0;
+    uint t1 = (upHi & midHi) | (upHi & t0) | (midHi & t0);
+
+    uint r0 = s0 ^ downLo;
+    uint c0 = s0 & downLo;
+    uint r1 = s1 ^ downHi ^ c0;
+    uint c1 = (s1 & downHi) | (s1 & c0) | (downHi & c0);
+    uint r2 = t1 ^ c1;
+    uint r3 = t1 & c1;
+
+    uint self = LoadPackedWord(wordX, rowY);
+
+    uint equalsThree = r0 & r1 & ~r2 & ~r3;          // 邻居数 == 3
+    uint equalsTwo   = ~r0 & r1 & ~r2 & ~r3;         // 邻居数 == 2
+
+    _ResultPacked[id.xy] = equalsThree | (self & equalsTwo);
+}
+
+// 显示与回读用：把位打包状态展开成 1 texel = 1 细胞的常规纹理。
+[numthreads(8, 8, 1)]
+void ExpandBitPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+
+    uint word = _SourcePacked.Load(int3(int(id.x) >> 5, int(id.y), 0));
+    bool alive = ((word >> (id.x & 31u)) & 1u) != 0u;
+    _Expanded[id.xy] = alive ? ALIVE : DEAD;
+}
+
+// ---------------------------------------------------------------------------
+// 档一：groupshared + halo tile
+//
+// 思路：每个线程组一次性把本组负责的 TILE×TILE 区域连同外圈 1 格 halo
+// （共 (TILE+2)^2 个格子）载入共享内存，之后每个线程的 8 次邻居读取全部命中共享内存，
+// 而不是各自去显存里取 8 次。全局读取次数从每线程 8 次降为每线程约 1 次。
+//
+// 注意两条容易踩的坑：
+//   1. 屏障（GroupMemoryBarrierWithGroupSync）必须被组内所有线程执行到，
+//      因此越界线程的提前 return 必须放在屏障之后；
+//   2. halo 的越界处理必须与边界语义一致（环面取对侧数据、死边界取 0），
+//      否则会出现"面板中间正常、接缝处出错"的隐蔽 bug。
+// ---------------------------------------------------------------------------
+
+groupshared float g_Tile[(TILE + 2) * (TILE + 2)];
+
+[numthreads(TILE, TILE, 1)]
+void StepShared(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
+{
+    const int tileStride = TILE + 2;
+
+    int2 groupOrigin = int2(gid.xy) * TILE;
+
+    // 载入整块含 halo 的区域（18×18 = 324 个格子）。
+    // 用"按行列步进"的双层循环代替"扁平下标 + 除法"：每个线程负责的行是
+    // tid.y 与 tid.y+TILE（若仍在范围内），列同理，组合起来恰好覆盖全部格子且不重复。
+    // 这样完全避开整数除法与取模——它们在 D3D11 上会被编译成一长串指令并触发编译器警告。
+    for (int ly = tid.y; ly < TILE + 2; ly += TILE)
+    {
+        for (int lx = tid.x; lx < TILE + 2; lx += TILE)
+        {
+            int2 p = groupOrigin + int2(lx - 1, ly - 1);   // -1 偏移即 halo
+            g_Tile[ly * tileStride + lx] = SampleState(p);
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // 屏障之后再让越界线程退出，避免组内线程数不一致导致的未定义行为。
+    if (id.x >= _Width || id.y >= _Height) return;
+
+    int2 centre = int2(tid.xy) + 1;
+    uint neighbours = 0;
+
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            if (dx == 0 && dy == 0) continue;
+            neighbours += g_Tile[(centre.y + dy) * tileStride + (centre.x + dx)] > 0.5 ? 1u : 0u;
+        }
+    }
+
+    bool self = g_Tile[centre.y * tileStride + centre.x] > 0.5;
+    bool next = self ? (neighbours == 2u || neighbours == 3u) : (neighbours == 3u);
+
+    _Result[id.xy] = next ? ALIVE : DEAD;
+}
+
+// ---------------------------------------------------------------------------
+// 随机初始状态（按种子）
+//
+// 每个细胞是否存活完全由 (seed, x, y) 的整数哈希决定，不依赖任何随机数状态，
+// 因此同一颗种子在任何机器、任何执行顺序下都得到同一张棋盘。
+// 注意：RandomHash 与 C# 侧 GameOfLife.Core.RandomField.Hash 必须逐行一致，
+// 两边由 GPU 一致性测试直接比对哈希——改了一边忘了另一边，测试会立刻红。
+//
+// 三个 kernel 分别对应三种纹理布局：整格（基础版与档一）、四通道打包、位打包。
+// ---------------------------------------------------------------------------
+
+uint RandomHash(uint seed, uint x, uint y)
+{
+    uint h = seed * 0x9E3779B9u;
+    h ^= x * 0x85EBCA6Bu;
+    h = (h ^ (h >> 13)) * 0xC2B2AE35u;
+    h ^= y * 0x27D4EB2Fu;
+    h = (h ^ (h >> 15)) * 0x165667B1u;
+    h ^= h >> 13;
+    return h;
+}
+
+[numthreads(8, 8, 1)]
+void FillRandom(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+
+    bool alive = RandomHash(_Seed, id.x, id.y) < _AliveThreshold;
+    _State[id.xy] = alive ? ALIVE : DEAD;
+}
+
+[numthreads(8, 8, 1)]
+void FillRandomPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TextureWidth || id.y >= _Height) return;
+
+    uint baseX = id.x * 4u;
+    _State[id.xy] = float4(
+        RandomHash(_Seed, baseX + 0u, id.y) < _AliveThreshold ? 1.0 : 0.0,
+        RandomHash(_Seed, baseX + 1u, id.y) < _AliveThreshold ? 1.0 : 0.0,
+        RandomHash(_Seed, baseX + 2u, id.y) < _AliveThreshold ? 1.0 : 0.0,
+        RandomHash(_Seed, baseX + 3u, id.y) < _AliveThreshold ? 1.0 : 0.0);
+}
+
+[numthreads(8, 8, 1)]
+void FillRandomBitPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _WordsPerRow || id.y >= _Height) return;
+
+    uint baseX = id.x * 32u;
+    uint word = 0u;
+
+    [unroll]
+    for (uint i = 0u; i < 32u; ++i)
+    {
+        if (RandomHash(_Seed, baseX + i, id.y) < _AliveThreshold)
+            word |= (1u << i);
+    }
+
+    _StatePacked[id.xy] = word;
+}

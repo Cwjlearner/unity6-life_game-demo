@@ -1,0 +1,19 @@
+{
+    "name": "GameOfLife.Editor",
+    "rootNamespace": "GameOfLife.EditorTools",
+    "references": [
+        "GameOfLife.Runtime",
+        "UnityEngine.UI"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

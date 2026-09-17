@@ -1,0 +1,43 @@
+# Unity 生成目录：可以完整重建，不应进版本库
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# 自动生成的 IDE 工程文件
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# 构建产物与缓存
+*.apk
+*.aab
+*.unitypackage
+*.app
+sysinfo.txt
+
+# 操作系统与编辑器杂项
+.DS_Store
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# Unity 测试结果（每次运行都会重新生成）
+TestResults*.xml

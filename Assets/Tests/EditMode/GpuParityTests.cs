@@ -1,8 +1,10 @@
 using GameOfLife.Core;
 using GameOfLife.Gpu;
 using NUnit.Framework;
+using Unity.Collections;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace GameOfLife.Tests
 {
@@ -205,6 +207,69 @@ namespace GameOfLife.Tests
             {
                 gpu.Dispose();
             }
+        }
+
+        [TestCase(GpuStepMode.Basic)]
+        [TestCase(GpuStepMode.SharedMemory)]
+        [TestCase(GpuStepMode.PackedChannels)]
+        [TestCase(GpuStepMode.BitPacked)]
+        public void DisplayTexture_IsAPlainPictureOfEveryCell(GpuStepMode mode)
+        {
+            RequireGpu();
+
+            const int size = 64;
+            var cpu = new GridModel(size, size, wrapEdges: true);
+            var gpu = new GpuGridKernel(_shader, size, size, wrapEdges: true, stepMode: mode);
+
+            try
+            {
+                cpu.FillRandom(4242, 0.35f);
+                gpu.FillRandom(4242, 0.35f);
+
+                RenderTexture display = gpu.DisplayTexture;
+
+                // 给人看的纹理必须是"一个像素一个细胞"：尺寸等于网格尺寸。
+                // 打包布局（4 细胞/像素 或 32 细胞/字）如果直接送去显示，
+                // 画面会被横向拉伸，并且多个细胞的颜色会混在一起。
+                Assert.AreEqual(
+                    size, display.width,
+                    $"{mode}: 显示纹理宽度应等于网格宽，实际 {display.width}——打包布局泄漏到显示层了");
+                Assert.AreEqual(size, display.height, $"{mode}: 显示纹理高度应等于网格高");
+
+                Assert.AreEqual(
+                    cpu.Snapshot().ComputeHash(),
+                    ReadDisplayTexture(gpu).ComputeHash(),
+                    $"{mode}: 显示出来的内容与逻辑状态不一致");
+            }
+            finally
+            {
+                gpu.Dispose();
+            }
+        }
+
+        /// <summary>把"给人看的那张纹理"回读成快照——它应该是一像素一细胞。</summary>
+        private static GridSnapshot ReadDisplayTexture(GpuGridKernel gpu)
+        {
+            RenderTexture texture = gpu.DisplayTexture;
+            AsyncGPUReadbackRequest request =
+                AsyncGPUReadback.Request(texture, 0, TextureFormat.RGBA32);
+            request.WaitForCompletion();
+            Assert.IsFalse(request.hasError, "显示纹理回读失败");
+
+            NativeArray<Color32> pixels = request.GetData<Color32>();
+            int width = texture.width;
+            int height = texture.height;
+
+            var alive = new bool[width * height];
+            int population = 0;
+            for (int i = 0; i < alive.Length; i++)
+            {
+                bool isAlive = pixels[i].r > 127;
+                alive[i] = isAlive;
+                if (isAlive) population++;
+            }
+
+            return GridSnapshot.FromCells(width, height, alive, population, gpu.Generation);
         }
 
         [TestCase(GpuStepMode.Basic)]

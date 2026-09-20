@@ -142,7 +142,13 @@ namespace GameOfLife.Gpu
                 GpuStepMode.BitPacked => "StepBitPacked",
                 _ => "Step",
             });
-            _kernelExpand = RequireKernel("ExpandBitPacked");
+            // 档二与档三都需要把打包布局展开成"一个像素一个细胞"才能显示；
+            // 基础版与档一本身就是这个布局，用不到这个 kernel（这里只是取一个合法值）。
+            _kernelExpand = RequireKernel(stepMode switch
+            {
+                GpuStepMode.PackedChannels => "ExpandPacked",
+                _ => "ExpandBitPacked",
+            });
             _kernelFill = RequireKernel(stepMode switch
             {
                 GpuStepMode.PackedChannels => "FillRandomPacked",
@@ -159,7 +165,7 @@ namespace GameOfLife.Gpu
 
             _current = CreateStateTexture("GoL_Current");
             _target = CreateStateTexture("GoL_Target");
-            _expanded = bitPacked ? CreateExpandedTexture() : null;
+            _expanded = NeedsExpandForDisplay ? CreateExpandedTexture() : null;
 
             _cellBuffer = new ComputeBuffer(maxStampCells, sizeof(int) * 2, ComputeBufferType.Structured);
             _cellScratch = new Vector2Int[maxStampCells];
@@ -425,35 +431,65 @@ namespace GameOfLife.Gpu
             get
             {
                 ThrowIfDisposed();
+
+                if (!NeedsExpandForDisplay)
+                    return _current;
+
                 ExpandIfNeeded();
-                return StepMode == GpuStepMode.BitPacked ? _expanded : _current;
+                return _expanded;
             }
         }
 
-        /// <summary>回读前必须确保展开纹理与当前代一致。</summary>
+        /// <summary>
+        /// 哪些档位的状态纹理不能直接给人看：档二把 4 个细胞塞进一个像素、
+        /// 档三把一个 32 位整数当 32 个细胞用，两者都必须先展开。
+        /// </summary>
+        private bool NeedsExpandForDisplay =>
+            StepMode == GpuStepMode.PackedChannels || StepMode == GpuStepMode.BitPacked;
+
+        /// <summary>
+        /// 回读源。档三的纹理是整型、CPU 侧没有对应的解包路径，所以先展开再回读；
+        /// 档二直接从打包纹理回读、由 CPU 解包——那样要读的数据还少 3/4。
+        /// </summary>
         private RenderTexture ReadbackSource
         {
             get
             {
+                if (StepMode != GpuStepMode.BitPacked)
+                    return _current;
+
                 ExpandIfNeeded(force: true);
-                return StepMode == GpuStepMode.BitPacked ? _expanded : _current;
+                return _expanded;
             }
         }
 
         private void ExpandIfNeeded(bool force = false)
         {
-            if (StepMode != GpuStepMode.BitPacked || _expanded == null) return;
+            if (!NeedsExpandForDisplay || _expanded == null) return;
             if (!force && _expandedGeneration == Generation) return;
 
             using (s_ExpandMarker.Auto())
             {
                 _shader.SetInt(s_Width, Width);
                 _shader.SetInt(s_Height, Height);
-                _shader.SetTexture(_kernelExpand, s_SourcePacked, _current);
+                _shader.SetInt(s_TextureWidth, _textureWidth);
+                _shader.SetInt(s_WordsPerRow, _textureWidth);
+
+                if (StepMode == GpuStepMode.BitPacked)
+                    _shader.SetTexture(_kernelExpand, s_SourcePacked, _current);
+                else
+                    _shader.SetTexture(_kernelExpand, s_Source, _current);
+
                 _shader.SetTexture(_kernelExpand, s_Expanded, _expanded);
+
+                // 两个展开 kernel 的工作粒度不同，启动宽度也不同：
+                //   档二 ExpandPacked    ：一个线程处理一个打包像素，一次输出 4 个细胞 → 按打包后的宽度启动
+                //   档三 ExpandBitPacked ：一个线程只输出一个细胞（自己算出该读哪个字）→ 按网格宽度启动
+                int expandWidth = StepMode == GpuStepMode.BitPacked ? Width : _textureWidth;
+
                 _shader.Dispatch(
                     _kernelExpand,
-                    GroupCount(Width, ClearThreadGroupSize),
+                    GroupCount(expandWidth, ClearThreadGroupSize),
                     GroupCount(Height, ClearThreadGroupSize),
                     1);
             }

@@ -91,7 +91,7 @@ GameOfLife        ← 选中它，检视面板就是控制台
   -testResults "F:\unity_project\My project\TestResults-EditMode.xml"
 ```
 
-预期：`total=84 passed=84 failed=0`。注意 `Unity.exe` 是启动器，命令会立即返回，真正的工作在后台进程里，请等结果文件生成（首次约 1 分钟）。
+预期：`total=88 passed=88 failed=0`。注意 `Unity.exe` 是启动器，命令会立即返回，真正的工作在后台进程里，请等结果文件生成（首次约 1 分钟）。
 
 去掉 `-nographics` 才会真正执行 GPU 一致性用例（加 `-nographics` 时它们会跳过，因为该模式没有图形设备）。
 
@@ -172,7 +172,7 @@ Assets/Scripts/Runtime/Gpu/      ComputeShader 驱动、四档档位、平台回
 Assets/Scripts/Runtime/Presentation/  控制层（启停/单步/调速/构型）与显示层（uGUI）
 Assets/Scripts/Editor/           自定义检视面板、演示场景生成器
 Assets/Shaders/LifePingPong.compute   十个 kernel（清零 / 盖印 / 四档演进 / 位打包展开）
-Assets/Tests/EditMode/           84 条 Edit Mode 测试
+Assets/Tests/EditMode/           88 条 Edit Mode 测试
 Assets/Scenes/LifeDemo.unity     由代码生成的演示场景
 Docs/                            制作计划、技术分析、实现文档
 tools/verify_patterns.py         构型数据独立验证器

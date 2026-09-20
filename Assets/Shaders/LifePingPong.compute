@@ -18,6 +18,7 @@
 #pragma kernel StampBitPacked
 #pragma kernel StepBitPacked
 #pragma kernel ExpandBitPacked
+#pragma kernel ExpandPacked
 #pragma kernel FillRandom
 #pragma kernel FillRandomPacked
 #pragma kernel FillRandomBitPacked
@@ -323,7 +324,24 @@ void StepBitPacked(uint3 id : SV_DispatchThreadID)
     _ResultPacked[id.xy] = equalsThree | (self & equalsTwo);
 }
 
-// 显示与回读用：把位打包状态展开成 1 texel = 1 细胞的常规纹理。
+// 档二显示用：把一个打包 texel（RGBA 四个通道各一个细胞）展开成 4 个普通 texel。
+// 打包布局如果直接送去显示，画面会被横向拉伸 4 倍，而且 4 个细胞的颜色会混在一起——
+// 所以显示前必须先展开成"一个像素一个细胞"。
+[numthreads(8, 8, 1)]
+void ExpandPacked(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TextureWidth || id.y >= _Height) return;   // 输入是打包纹理的尺寸
+
+    float4 texel = _Source.Load(int3(id.xy, 0));
+    uint baseX = id.x * 4u;
+
+    _Expanded[uint2(baseX + 0u, id.y)] = texel.r > 0.5 ? ALIVE : DEAD;
+    _Expanded[uint2(baseX + 1u, id.y)] = texel.g > 0.5 ? ALIVE : DEAD;
+    _Expanded[uint2(baseX + 2u, id.y)] = texel.b > 0.5 ? ALIVE : DEAD;
+    _Expanded[uint2(baseX + 3u, id.y)] = texel.a > 0.5 ? ALIVE : DEAD;
+}
+
+// 档三显示与回读用：把位打包状态展开成 1 texel = 1 细胞的常规纹理。
 [numthreads(8, 8, 1)]
 void ExpandBitPacked(uint3 id : SV_DispatchThreadID)
 {
